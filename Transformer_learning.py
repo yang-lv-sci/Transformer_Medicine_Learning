@@ -1,16 +1,96 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jun 24 17:25:42 2025
+Created on Tue Jun 24 09:03:44 2025
 
-@author: lvyang
+@author: Administrator
 """
+
+from datasets import load_dataset
+from transformers import BertTokenizer
+from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
 import math
+import warnings
 
+# 抑制所有警告
+warnings.filterwarnings("ignore")
+
+# 预设超参数
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DL_batch_size = 16
+vocab_size = 30522 # tokenizer 的词汇总数，例如 BERT 是 30522
+d_model = 512  # 一般是512或者768
+max_len = 512 # 超过进行截断
+num_heads = 4
+dropout_rate = 0.2
+d_ff = 1024
 
-# 1. Input Embedding
+# 1. 准备 NLP 数据集
+# pip install datasets
+# conda install fsspec
+# conda install numpy
+# conda install filelock
+# pip install --upgrade huggingface-hub 重启内核
+
+# 加载 IMDB 数据集 IMDB: 用于情感分析任务，包含来自电影评论的数据
+dataset = load_dataset("imdb")
+#可以访问 dataset['train'] 来获取训练数据，dataset['test'] 来获取测试数据
+print('训练集中的一条数据示例\n',dataset['train'][0])
+
+# 2. 数据预处理与 Tokenization
+#为了将文本数据转换为模型可以处理的格式，我们需要将文本进行 Tokenization (Inputs 数字化)
+
+# 使用 BERT 的 Tokenizer （大小写不敏感）
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+
+# 对一条样本文本进行 Tokenization
+# numpy 1.26.3 会出现ModuleNotFoundError: No module named 'numpy.rec'问题
+# 使用conda uninstall numpy 后使用 pip install numpy
+# 出现ModuleNotFoundError: No module named 'transformers.models.auto.tokenization_auto' 重启内核无效
+# pip install transformers 后跳回 # 1. 准备 NLP 数据集解决
+
+# Tokenization 函数
+def tokenize_function(examples):
+    # return_tensors="pt"将结果返回为 PyTorch 张量格式，以便后续训练
+    # padding=True：确保每个句子的长度一致（根据最大句子长度进行填充）。
+    # truncation=True：如果句子超过了最大长度，会进行截断
+    """truncation的最大长度是多少？"""
+    return tokenizer(examples['text'], padding=True, truncation=True, return_tensors="pt")
+
+# 对 IMDB 数据集进行 Tokenization
+def preprocess_data(dataset):
+    tokenized_datasets = dataset.map(tokenize_function, batched=True)
+    """有坑"""
+    """
+    datasets.Dataset.map() 内部自动将返回值转换成 Python 列表或 NumPy 数组，
+    它会把你的 Tensor 自动转为 list,这是 datasets 库的默认行为，为了兼容其存储结构
+    正确做法：必须 显式设置格式为 tensor，不然Embedding那边会报错
+    """
+    tokenized_datasets.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+    return tokenized_datasets
+
+# 处理训练集和测试集
+# 处理后每一条数据有一个input_ids和attention_mask
+train_data = preprocess_data(dataset['train'])
+test_data = preprocess_data(dataset['test'])
+
+print(train_data['input_ids'][0])  # 查看第一条数据的 input_ids
+
+# 3. 处理 DataLoader
+# 当我们处理完 Tokenization 后，我们可以使用 DataLoader 来迭代数据集，方便后续的训练。
+# 什么是DataLoader
+
+# 创建 DataLoader
+
+train_dataloader = DataLoader(train_data, batch_size = DL_batch_size, shuffle=True)
+test_dataloader = DataLoader(test_data, batch_size = DL_batch_size)
+
+# 每个批次的 input_ids 和 attention_mask 都将是一个 PyTorch 张量，形状为 [batch_size, sequence_length]
+# input_ids 是输入的词汇 ID 序列。
+# attention_mask 是一个二值矩阵，指示哪些位置是真实的输入（1），哪些是填充的位置（0）
+
+# 4. Input Embedding
 # Transformer 接收的是一系列整数（token IDs），这些整数是通过 tokenizer 将文本转成词汇表索引。
 #但模型不能直接处理整数，它需要将这些整数转为高维向量。这一步就是 Input Embedding 的任务
 
@@ -39,7 +119,15 @@ class InputEmbedding(nn.Module):
         #Transformer 原始论文中提到，为了保持嵌入的方差与位置编码相匹配，必须放大输入嵌入。
         #如果不乘这个因子，embedding 的值可能相对较小，和后面加的 positional encoding 不成比例
         
-# 2. Positional Encoding
+embed_layer = InputEmbedding(vocab_size, d_model).to(device) #实例化
+
+"""# 获取一批数据并嵌入,仅用于测试，后面训练会在循环中持续推进, 输入编码不管attention_mask
+batch = next(iter(train_dataloader))
+input_ids = batch["input_ids"].to(device)  # Tensor
+out = embed_layer(input_ids) 
+print(out.shape)  # torch.Size([16, 512, 512]) [batch_size, seq_len, d_model]"""
+
+# 5. Positional Encoding
 #由于标准 Transformer 结构中没有 RNN，因此必须加入显式的位置信息，这个数值是固定的
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=512):
@@ -68,8 +156,16 @@ class PositionalEncoding(nn.Module):
         # 把前 seq_len 个位置编码加到输入上
         x = x + self.pe[:, :seq_len]
         return x
-    
-# 3. Multi-Head Self-Attention
+
+"""# 获取一批数据并嵌入,仅用于测试，后面训练会在循环中持续推进, 输入编码不管attention_mask
+batch = next(iter(train_dataloader))
+input_ids = batch["input_ids"].to(device)  # Tensor
+out = embed_layer(input_ids) 
+print(out.shape)  # torch.Size([16, 512, 512]) [batch_size, seq_len, d_model]
+pos_encoder = PositionalEncoding(d_model, max_len)
+out_with_pos = pos_encoder(out)"""
+
+# 6. Multi-Head Self-Attention
 
 #输入输出都是[B, L, D]
 
@@ -108,11 +204,6 @@ class MultiHeadSelfAttention(nn.Module):
             # 为什么要加 Mask？
             # 1. 对于不等长句子，我们会用 [PAD] token 补齐。这些 token 不应该被模型注意到（无信息）
             # 2. 在训练语言模型时，为了防止模型“偷看”未来的 token，需要屏蔽未来位置（用在 Decoder）
-            """scores 的 shape 是 [batch, heads, seq_len, seq_len]（比如 [16, 4, 512, 512]）
-            你的 mask shape 是 [batch, seq_len]（比如 [16, 512]）
-            直接用 scores.masked_fill(mask == 0, -inf)，broadcasting 失败，PyTorch 无法自动对齐维度"""
-            # mask: [batch, seq_len] -> [batch, 1, 1, seq_len]
-            mask = mask.unsqueeze(1).unsqueeze(2)  # 增加两个维度
             scores = scores.masked_fill(mask == 0, float("-inf"))
             """对于 mask == 0 的位置（即 不应该关注的位置），把 scores 置为负无穷 -inf。
             后面进入 softmax，这些位置就会变成 0 权重（因为 softmax(-inf) ≈ 0）"""
@@ -148,47 +239,19 @@ class MultiHeadSelfAttention(nn.Module):
         out = self.out_proj(context)  
         
         return out
-
-# 4. MultiHead Cross Attention （Decoder部分）    
-class MultiHeadCrossAttention(nn.Module):
     
-    """跨注意力，Q来自decoder，K、V来自encoder"""
-    
-    def __init__(self, d_model, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-
-        self.q_linear = nn.Linear(d_model, d_model).to(device)
-        self.k_linear = nn.Linear(d_model, d_model).to(device)
-        self.v_linear = nn.Linear(d_model, d_model).to(device)
-        self.out_proj = nn.Linear(d_model, d_model).to(device)
-
-    def forward(self, query, key, value, mask=None):
-        B, L_q, D = query.shape
-        L_k = key.shape[1]
-        
-        Q = self.q_linear(query).view(B, L_q, self.num_heads, self.head_dim).transpose(1,2)
-        K = self.k_linear(key).view(B, L_k, self.num_heads, self.head_dim).transpose(1,2)
-        V = self.v_linear(value).view(B, L_k, self.num_heads, self.head_dim).transpose(1,2)
-        
-        #  k,v 的维度需要相同
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        if mask is not None:
-            # mask: [batch, seq_len] -> [batch, 1, 1, seq_len]
-            mask = mask.unsqueeze(1).unsqueeze(2)  # 增加两个维度
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-            
-        attn_weights = torch.softmax(scores, dim=-1)
-        context = torch.matmul(attn_weights, V)
-        context = context.transpose(1, 2).contiguous().view(B, L_q, D)
-        out = self.out_proj(context)
-        return out    
+"""# 获取一批数据并嵌入,仅用于测试，后面训练会在循环中持续推进, 输入编码不管attention_mask
+batch = next(iter(train_dataloader))
+input_ids = batch["input_ids"].to(device)  # Tensor
+out = embed_layer(input_ids)      # 正确 ✅
+print(out.shape)  # torch.Size([16, 512, 512]) [batch_size, seq_len, d_model]
+pos_encoder = PositionalEncoding(d_model, max_len)
+out_with_pos = pos_encoder(out)
+mhsa = MultiHeadSelfAttention(d_model, num_heads)
+mhsa_out = mhsa(out_with_pos)"""
 
 class AddNorm(nn.Module):
-    def __init__(self, d_model, dropout = 0.1 ):
+    def __init__(self, d_model, dropout = 0.1):
         super().__init__()
         self.norm = nn.LayerNorm(d_model).to(device)
         #[PAD] 是否是 0 向量不会影响其他 token只要在 Attention 和 Loss 时屏蔽掉 padding 部分，一切都正常 ✅
@@ -200,6 +263,18 @@ class AddNorm(nn.Module):
         sublayer_out：比如来自 MultiHeadAttention(x) 或 FFN(x)
         输出：做了残差 + LayerNorm 的结果"""
         
+"""# 获取一批数据并嵌入,仅用于测试，后面训练会在循环中持续推进, 输入编码不管attention_mask
+batch = next(iter(train_dataloader))
+input_ids = batch["input_ids"].to(device)  # Tensor
+out = embed_layer(input_ids)
+print(out.shape)  # torch.Size([16, 512, 512]) [batch_size, seq_len, d_model]
+pos_encoder = PositionalEncoding(d_model, max_len)
+out_with_pos = pos_encoder(out)
+mhsa = MultiHeadSelfAttention(d_model, num_heads)
+mhsa_out = mhsa(out_with_pos)
+ad = AddNorm(d_model, dropout_rate)
+ad_out = ad(out_with_pos,mhsa_out)"""
+
 class FeedForward(nn.Module):
     """
     Transformer 论文中，FeedForward Network 是两个全连接层 + 激活 + dropout：
@@ -221,46 +296,17 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
     
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
-        super().__init__()
-        self.mhsa = MultiHeadSelfAttention(d_model, num_heads)
-        self.addnorm1 = AddNorm(d_model, dropout)
-        self.ffn = FeedForward(d_model, d_ff, dropout)
-        self.addnorm2 = AddNorm(d_model, dropout)
-
-    def forward(self, x, mask=None):
-        attn_out = self.mhsa(x, mask)          # MHSA，支持传 mask
-        x = self.addnorm1(x, attn_out)         # Add & Norm
-
-        ff_out = self.ffn(x)                    # FeedForward
-        x = self.addnorm2(x, ff_out)            # Add & Norm
-        return x
-    
-class TransformerDecoderBlock(nn.Module):
-    """还需要补充解释"""
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
-        super().__init__()
-        self.self_attn = MultiHeadSelfAttention(d_model, num_heads)
-        self.addnorm1 = AddNorm(d_model, dropout)
-
-        self.cross_attn = MultiHeadCrossAttention(d_model, num_heads)
-        self.addnorm2 = AddNorm(d_model, dropout)
-
-        self.ffn = FeedForward(d_model, d_ff, dropout)
-        self.addnorm3 = AddNorm(d_model, dropout)
-
-    def forward(self, x, enc_out, self_mask=None, cross_mask=None):
-        # 1. Masked Self-Attention (解码器只看自己和前面)
-        sa_out = self.self_attn(x, self_mask)
-        x = self.addnorm1(x, sa_out)
-
-        # 2. Cross-Attention (解码器每个token都能看encoder输出)
-        ca_out = self.cross_attn(x, enc_out, enc_out, cross_mask)
-        x = self.addnorm2(x, ca_out)
-
-        # 3. Feed Forward
-        ff_out = self.ffn(x)
-        x = self.addnorm3(x, ff_out)
-
-        return x
+# 获取一批数据并嵌入,仅用于测试，后面训练会在循环中持续推进, 输入编码不管attention_mask
+batch = next(iter(train_dataloader))
+input_ids = batch["input_ids"].to(device)  # Tensor
+out = embed_layer(input_ids)
+print(out.shape)  # torch.Size([16, 512, 512]) [batch_size, seq_len, d_model]
+pos_encoder = PositionalEncoding(d_model, max_len)
+out_with_pos = pos_encoder(out)
+mhsa = MultiHeadSelfAttention(d_model, num_heads)
+mhsa_out = mhsa(out_with_pos)
+ad = AddNorm(d_model, dropout_rate)
+ad_out = ad(out_with_pos,mhsa_out)
+ffd = FeedForward(d_model, d_ff, dropout_rate)
+ffd_out = ffd(ad_out)
+ad_out = ad(ad_out, ffd_out)
