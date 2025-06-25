@@ -264,3 +264,16 @@ class TransformerDecoderBlock(nn.Module):
         x = self.addnorm3(x, ff_out)
 
         return x
+
+class FeatureEmbedding(nn.Module):
+    """将每个特征（视作token）线性嵌入到d_model维度"""
+    def __init__(self, num_features, d_model):
+        super().__init__()
+        self.embedding = nn.Linear(1, d_model).to(device)
+        self.num_features = num_features
+
+    def forward(self, x):
+        # x: [batch, num_features]
+        x = x.unsqueeze(-1)  # [batch, num_features, 1]
+        x = self.embedding(x)  # [batch, num_features, d_model]
+        return x
